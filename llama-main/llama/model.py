@@ -314,16 +314,11 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        )
-        self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
-        )
-        self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        )
+        self.w1 = TernaryLinear(dim, hidden_dim)
+        self.w2 = TernaryLinear(hidden_dim, dim)
+        self.w3 = TernaryLinear(dim, hidden_dim)
 
+       
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 

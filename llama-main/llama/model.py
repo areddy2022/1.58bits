@@ -4,6 +4,7 @@
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
+from TernaryLinear import TernaryLinear
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -204,34 +205,10 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = ColumnParallelLinear(
-            args.dim,
-            args.n_heads * self.head_dim,
-            bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
-        self.wk = ColumnParallelLinear(
-            args.dim,
-            self.n_kv_heads * self.head_dim,
-            bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
-        self.wv = ColumnParallelLinear(
-            args.dim,
-            self.n_kv_heads * self.head_dim,
-            bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
-        )
-        self.wo = RowParallelLinear(
-            args.n_heads * self.head_dim,
-            args.dim,
-            bias=False,
-            input_is_parallel=True,
-            init_method=lambda x: x,
-        )
+        self.wq = TernaryLinear(args.dim, args.n_heads * self.head_dim)
+        self.wk = TernaryLinear(args.dim, self.n_kv_heads * self.head_dim)
+        self.wv = TernaryLinear(args.dim, self.n_kv_heads * self.head_dim)
+        self.wo = TernaryLinear(args.n_heads * self.head_dim, args.dim)
 
         self.cache_k = torch.zeros(
             (
@@ -327,6 +304,9 @@ class FeedForward(nn.Module):
             w3 (ColumnParallelLinear): Linear transformation for the third layer.
 
         """
+
+        # this is where we would want to change to add in the ternary linear layers
+
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
         # custom dim factor multiplier

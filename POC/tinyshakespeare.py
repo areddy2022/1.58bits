@@ -89,6 +89,28 @@ class TransformerModel(nn.Module):
         output = self.fc(output)
         return output
 
+
+def train(model, dataloader, optimizer, criterion, epochs):
+    for epoch in range(epochs):
+        for batch in dataloader:
+            optimizer.zero_grad()
+            src = batch[:-1]
+            tgt = batch[1:]
+            output = model(src, tgt)
+            loss = criterion(output.view(-1, output.size(-1)), tgt.view(-1))
+            loss.backward()
+
+            # Apply ternary quantization to the model's weights
+            for name, param in model.named_parameters():
+                if 'weight' in name:
+                    quantized_weights = ternary_quantize(param.data)
+                    param.data = quantized_weights.packed_tensor
+
+            optimizer.step()
+
+        print(f"Epoch [{epoch + 1}/{epochs}], Loss: {loss.item():.4f}")
+
+
 # Set up the dataset and dataloader
 file_path = './POC/tinyshakespeare.py'
 seq_length = 100

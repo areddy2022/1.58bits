@@ -73,6 +73,22 @@ class ShakespeareDataset(Dataset):
         seq_indices = [self.char_to_idx[ch] for ch in seq]
         return torch.tensor(seq_indices)
 
+
+class TransformerModel(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, num_heads, num_layers):
+        super(TransformerModel, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.transformer = nn.Transformer(d_model=embedding_dim, nhead=num_heads, num_encoder_layers=num_layers,
+                                          num_decoder_layers=num_layers)
+        self.fc = nn.Linear(embedding_dim, vocab_size)
+
+    def forward(self, src, tgt):
+        src_embeddings = self.embedding(src)
+        tgt_embeddings = self.embedding(tgt)
+        output = self.transformer(src_embeddings, tgt_embeddings)
+        output = self.fc(output)
+        return output
+
 # Set up the dataset and dataloader
 file_path = './POC/tinyshakespeare.py'
 seq_length = 100

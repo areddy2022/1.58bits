@@ -111,6 +111,24 @@ def train(model, dataloader, optimizer, criterion, epochs):
         print(f"Epoch [{epoch + 1}/{epochs}], Loss: {loss.item():.4f}")
 
 
+def generate_text(model, start_text, num_chars, temperature=0.8):
+    model.eval()
+    text = start_text
+    src = torch.tensor([dataset.char_to_idx[ch] for ch in start_text]).unsqueeze(0)
+
+    for _ in range(num_chars):
+        tgt = src.clone()
+        output = model(src, tgt)
+        output = output[-1, :, :] / temperature
+        probabilities = torch.softmax(output, dim=-1)
+        next_char_idx = torch.multinomial(probabilities, 1).item()
+        next_char = dataset.idx_to_char[next_char_idx]
+        text += next_char
+        src = torch.cat([src, torch.tensor([[next_char_idx]])], dim=1)
+
+    return text
+
+
 # Set up the dataset and dataloader
 file_path = './POC/tinyshakespeare.py'
 seq_length = 100

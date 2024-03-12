@@ -1,89 +1,78 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
 
-
-def RoundClip(x, a, b):
-    return torch.clamp(torch.round(x), a, b)
-
-
-def ternary_quantize(weights, gamma=1.0):
-    """
-    Perform ternary quantization on the input weights.
-
-    Args:
-        weights (torch.Tensor): Input weights tensor.
-        gamma (float): Scaling factor for quantization.
-
-    Returns:
-        torch.Tensor: Quantized weights tensor.
-    """
-    # Compute the scaling factor
-    eps = 1e-7
-    W_bar = torch.mean(torch.abs(weights))
-    gamma_prime = gamma / (W_bar + eps)
-
-    # Perform ternary quantization
-    quantized_weights = torch.where(weights > 0.5, torch.ones_like(weights),
-                                    torch.where(weights < -0.5, -torch.ones_like(weights),
-                                                torch.zeros_like(weights)))
-
-    return RoundClip(gamma_prime * quantized_weights, -1, 1)
-
-class TernaryLinear(nn.Module):
-    def __init__(self, in_features, out_features):
-        super(TernaryLinear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
-        nn.init.normal_(self.weight)  # Initialize weights
+class TernaryQuantization(nn.Module):
+    def __init__(self):
+        super(TernaryQuantization, self).__init__()
 
     def forward(self, x):
-        # Apply ternary quantization to weights
-        quantized_weights = ternary_quantize(self.weight)
-        return F.linear(x, quantized_weights, None)
+        mean_abs = x.abs().mean()
+        return torch.clip(torch.round(x / mean_abs), -1, 1)
 
-    def view_quantized_weights(model):
-        for module in model.modules():
-            if isinstance(module, TernaryLinear):
-                weight = module.weight.data  # original weight data
-                quantized_weight = ternary_quantize(weight)
-                print(quantized_weight)
+    def encode_to_packed_bytes(self, x):
+        # Assuming x is a tensor of ternary quantized values (-1, 0, 1)
+        # First, remap values from -1,0,1 to 0,1,2 for bit representation
+        x = x.add(1).to(torch.uint8)
 
+        # Pack 4 2-bit values into one byte
+        packed = torch.bitwise_or(torch.bitwise_or(x[::4], x[1::4].left_shift(2)),
+                                  torch.bitwise_or(x[2::4].left_shift(4), x[3::4].left_shift(6)))
 
-class SimpleGPT(nn.Module):
-    def __init__(self, num_tokens, dim, num_layers, num_heads):
-        super(SimpleGPT, self).__init__()
-        self.token_embedding = nn.Embedding(num_tokens, dim)
-        self.positional_embedding = nn.Parameter(torch.zeros(1, num_tokens, dim))
-        self.layers = nn.ModuleList([])
-        for _ in range(num_layers):
-            self.layers.append(nn.TransformerEncoderLayer(d_model=dim, nhead=num_heads, batch_first=True))
-            # Replace linear layers in Transformer with TernaryLinear
-            self.layers[-1].linear1 = TernaryLinear(dim, dim * 4)
-            self.layers[-1].linear2 = TernaryLinear(dim * 4, dim)
+        return packed
 
-        self.to_logits = nn.Linear(dim, num_tokens)
+    def decode_from_packed_bytes(self, packed):
+        # Unpack bytes to 4 values
+        unpacked = torch.stack([(packed & 3),
+                                (packed >> 2) & 3,
+                                (packed >> 4) & 3,
+                                (packed >> 6) & 3], dim=-1).flatten()
 
-    def forward(self, x):
-        seq_length = x.size(1)
-        # Ensure positional_embedding is the right size
-        if seq_length > self.positional_embedding.size(1):
-            raise ValueError(
-                "Input sequence length exceeds the maximum length for which positional embeddings are defined.")
+        # Remap 0,1,2 back to ternary values -1,0,1
+        return unpacked.sub(1).to(torch.float32)
 
-        # Use the relevant portion of the positional_embedding
-        positional_embedding = self.positional_embedding[:, :seq_length, :]
+# Load the tokenizer
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 
-        x = self.token_embedding(x) + positional_embedding
-        for layer in self.layers:
-            x = layer(x)
-        logits = self.to_logits(x)
-        return logits
+# Assuming QuantizedTransformer wraps around GPT2LMHeadModel instead of GPT2Model
+class QuantizedTransformer(nn.Module):
+    def __init__(self, original_model):
+        super(QuantizedTransformer, self).__init__()
+        self.original_model = original_model
+        self.quantize = TernaryQuantization()
 
+    def forward(self, input_ids):
+        with torch.no_grad():
+            self.original_model.eval()
+            for param in self.original_model.parameters():
+                quantized = self.quantize(param.data)
+                param.data = quantized
+
+        return self.original_model(input_ids, use_cache=False)
+
+    def generate(self, *args, **kwargs):
+        return self.original_model.generate(*args, **kwargs)
+
+# Load a pre-trained GPT-2 LM Head model
+model = GPT2LMHeadModel.from_pretrained('gpt2')
+
+# Replace the model with the quantized version
+quantized_model = QuantizedTransformer(model)
+
+# Function to generate text from the model
+def generate_text(model, input_text, max_length=50):
+    # Encode the input text
+    input_ids = tokenizer.encode(input_text, return_tensors='pt')
+
+    # Generate predictions
+    with torch.no_grad():
+        output_ids = model.generate(input_ids, max_length=max_length)
+
+    # Decode and return the generated text
+    generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    return generated_text
 
 # Example usage
-model = SimpleGPT(num_tokens=10000, dim=512, num_layers=6, num_heads=8)
-input_ids = torch.randint(0, 10000, (1, 1024))
-logits = model(input_ids)
-TernaryLinear.view_quantized_weights(model)
+input_text = "What color is the sky?"
+generated_text = generate_text(quantized_model, input_text)
+print(generated_text)

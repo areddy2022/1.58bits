@@ -1,136 +1,150 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
 
-class TernaryTensor:
-    def __init__(self, tensor):
-        self.shape = tensor.shape
-        self.packed_tensor = self.pack_tensor(tensor)
-
-    def pack_tensor(self, tensor):
-        # Flatten the tensor
-        flat_tensor = tensor.view(-1)
-
-        # Convert ternary values to two bits
-        bit_values = torch.where(flat_tensor == 1, torch.tensor(0b11),
-                                 torch.where(flat_tensor == -1, torch.tensor(0b01),
-                                             torch.tensor(0b00)))
-
-        # Pack the bits into bytes
-        packed_tensor = torch.bitwise_or(bit_values[0::4], bit_values[1::4] << 2)
-        packed_tensor = torch.bitwise_or(packed_tensor, bit_values[2::4] << 4)
-        packed_tensor = torch.bitwise_or(packed_tensor, bit_values[3::4] << 6)
-
-        return packed_tensor.type(torch.uint8)
-
-    def unpack_tensor(self):
-        # Unpack the bits from bytes
-        unpacked_tensor = torch.empty(self.packed_tensor.shape[0] * 4, dtype=torch.int8)
-        unpacked_tensor[0::4] = torch.bitwise_and(self.packed_tensor, 0b00000011)
-        unpacked_tensor[1::4] = torch.bitwise_and(self.packed_tensor >> 2, 0b00000011)
-        unpacked_tensor[2::4] = torch.bitwise_and(self.packed_tensor >> 4, 0b00000011)
-        unpacked_tensor[3::4] = torch.bitwise_and(self.packed_tensor >> 6, 0b00000011)
-
-        # Convert two bits to ternary values
-        ternary_tensor = torch.where(unpacked_tensor == 0b11, torch.tensor(1),
-                                     torch.where(unpacked_tensor == 0b01, torch.tensor(-1),
-                                                 torch.tensor(0)))
-
-        return ternary_tensor.view(self.shape)
+# Ternary quantization functions
+def quantization_function(weights, gamma, epsilon):
+    return torch.clamp(torch.round(weights / (gamma + epsilon)), -1, 1)
 
 
-def ternary_quantize(weights, gamma=1.0):
-    # Compute the scaling factor
-    eps = 1e-7
-    W_bar = torch.mean(torch.abs(weights))
-    gamma_prime = gamma / (W_bar + eps)
-
-    # Perform ternary quantization
-    quantized_weights = torch.where(weights > 0.5 * gamma_prime, torch.ones_like(weights),
-                                    torch.where(weights < -0.5 * gamma_prime, -torch.ones_like(weights),
-                                                torch.zeros_like(weights)))
-
-    # Pack the ternary values into two bits
-    ternary_tensor = TernaryTensor(quantized_weights)
-
-    return ternary_tensor
-
-class ShakespeareDataset(Dataset):
-    def __init__(self, file_path, seq_length):
-        with open(file_path, 'r', encoding='utf-8') as file:
-            self.text = file.read()
-        self.chars = sorted(list(set(self.text)))
-        self.char_to_idx = {ch: i for i, ch in enumerate(self.chars)}
-        self.idx_to_char = {i: ch for i, ch in enumerate(self.chars)}
-        self.seq_length = seq_length
-
-    def __len__(self):
-        return len(self.text) - self.seq_length
-
-    def __getitem__(self, idx):
-        seq = self.text[idx:idx + self.seq_length]
-        seq_indices = [self.char_to_idx[ch] for ch in seq]
-        return torch.tensor(seq_indices)
+def round_clip(x, a, b):
+    return torch.max(a, torch.min(b, torch.round(x)))
 
 
-class TransformerModel(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, num_heads, num_layers):
-        super(TransformerModel, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.transformer = nn.Transformer(d_model=embedding_dim, nhead=num_heads, num_encoder_layers=num_layers,
-                                          num_decoder_layers=num_layers)
-        self.fc = nn.Linear(embedding_dim, vocab_size)
+def gamma(weights):
+    return torch.mean(torch.abs(weights))
 
-    def forward(self, src, tgt):
-        src_embeddings = self.embedding(src)
-        tgt_embeddings = self.embedding(tgt)
-        output = self.transformer(src_embeddings, tgt_embeddings)
-        output = self.fc(output)
+# Ternary quantized linear layer
+class TernaryLinear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features)
+        self.quantized_weight = None
+
+    def forward(self, x):
+        if self.quantized_weight is None:
+            gamma_val = gamma(self.weight)
+            ternary_weights = quantization_function(self.weight, gamma_val, 1e-6)
+            self.quantized_weight = self.pack_weights(ternary_weights)
+        return self.ternary_linear(x, self.quantized_weight, self.bias)
+
+    def pack_weights(self, ternary_weights):
+        packed_weights = torch.zeros((ternary_weights.shape[0], ternary_weights.shape[1] // 16), dtype=torch.int64)
+        for i in range(ternary_weights.shape[0]):
+            for j in range(ternary_weights.shape[1] // 16):
+                packed_value = 0
+                for k in range(16):
+                    value = int(ternary_weights[i, j * 16 + k].item())
+                    packed_value |= (value + 1) << (k * 2)
+                packed_weights[i, j] = packed_value
+        return packed_weights
+
+    def ternary_linear(self, x, packed_weights, bias):
+        batch_size, seq_length, input_dim = x.shape
+        x_reshaped = x.reshape(batch_size * seq_length, input_dim)
+        output_dim = packed_weights.shape[0]
+        output = torch.zeros((batch_size * seq_length, output_dim), dtype=torch.float32, device=x.device)
+        for i in range(packed_weights.shape[0]):
+            for j in range(packed_weights.shape[1]):
+                packed_value = packed_weights[i, j].item()
+                for k in range(16):
+                    value = (packed_value >> (k * 2)) & 3
+                    if value == 1:
+                        output[:, i] += x_reshaped[:, j * 16 + k]
+                    elif value == 2:
+                        output[:, i] -= x_reshaped[:, j * 16 + k]
+        if bias is not None:
+            output += bias
+        output = output.reshape(batch_size, seq_length, output_dim)
         return output
 
+# Transformer model with ternary quantized weights
+class TernaryTransformer(nn.Module):
+    def __init__(self, vocab_size, d_model, nhead, num_layers):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = nn.Embedding(100, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=d_model * 4, activation='gelu',
+                                                   batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.decoder = TernaryLinear(d_model, vocab_size)
 
-def train(model, dataloader, optimizer, criterion, epochs):
-    for epoch in range(epochs):
-        for batch in dataloader:
-            optimizer.zero_grad()
-            src = batch[:-1]
-            tgt = batch[1:]
-            output = model(src, tgt)
-            loss = criterion(output.view(-1, output.size(-1)), tgt.view(-1))
-            loss.backward()
-
-            # Apply ternary quantization to the model's weights
-            for name, param in model.named_parameters():
-                if 'weight' in name:
-                    quantized_weights = ternary_quantize(param.data)
-                    param.data = quantized_weights.packed_tensor
-
-            optimizer.step()
-
-        print(f"Epoch [{epoch + 1}/{epochs}], Loss: {loss.item():.4f}")
+    def forward(self, x):
+        positions = torch.arange(x.size(1)).unsqueeze(0).expand(x.size(0), -1).to(x.device)
+        x = self.embedding(x) + self.pos_encoder(positions)
+        x = self.transformer_encoder(x)
+        x = self.decoder(x)
+        return x
 
 
-def generate_text(model, start_text, num_chars, temperature=0.8):
-    model.eval()
-    text = start_text
-    src = torch.tensor([dataset.char_to_idx[ch] for ch in start_text]).unsqueeze(0)
+# Load and preprocess the Shakespeare dataset
+with open('shakespeare.txt', 'r', encoding='utf-8') as f:
+    text = f.read()
 
-    for _ in range(num_chars):
-        tgt = src.clone()
-        output = model(src, tgt)
-        output = output[-1, :, :] / temperature
-        probabilities = torch.softmax(output, dim=-1)
-        next_char_idx = torch.multinomial(probabilities, 1).item()
-        next_char = dataset.idx_to_char[next_char_idx]
-        text += next_char
-        src = torch.cat([src, torch.tensor([[next_char_idx]])], dim=1)
-
-    return text
+chars = sorted(list(set(text)))
+char_to_idx = {ch: i for i, ch in enumerate(chars)}
+idx_to_char = {i: ch for i, ch in enumerate(chars)}
 
 
-# Set up the dataset and dataloader
-file_path = './POC/tinyshakespeare.py'
-seq_length = 100
-dataset = ShakespeareDataset(file_path, seq_length)
-dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+def encode(text):
+    return [char_to_idx[ch] for ch in text]
+
+
+def decode(indices):
+    return ''.join(idx_to_char[i] for i in indices)
+
+
+# Hyperparameters
+vocab_size = len(chars)
+d_model = 128
+nhead = 4
+num_layers = 2
+batch_size = 16
+seq_length = 64
+num_epochs = 10
+
+# Create the model and optimizer
+model = TernaryTransformer(vocab_size, d_model, nhead, num_layers)
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+# Training loop
+for epoch in range(num_epochs):
+    print(f"Epoch {epoch + 1}/{num_epochs}")
+
+    encoded_text = encode(text)
+    num_batches = len(encoded_text) // (batch_size * seq_length)
+    encoded_text = encoded_text[:num_batches * batch_size * seq_length]
+    encoded_text = torch.tensor(encoded_text).view(batch_size, -1)
+
+    for i in range(0, encoded_text.size(1) - seq_length, seq_length):
+        x = encoded_text[:, i:i + seq_length]
+        y = encoded_text[:, i + 1:i + seq_length + 1]
+
+        optimizer.zero_grad()
+        outputs = model(x)
+
+        # Reshape the outputs tensor to match the target tensor shape
+        outputs_reshaped = outputs.view(batch_size, seq_length, -1)
+        loss = nn.functional.cross_entropy(outputs_reshaped.reshape(-1, outputs_reshaped.size(-1)), y.reshape(-1))
+        loss.backward()
+        optimizer.step()
+
+        if (i // seq_length) % 100 == 0:
+            print(f"Batch {i // seq_length}, Loss: {loss.item():.4f}")
+
+# Generate sample text
+context = "To be, or not to be:"
+context_encoded = encode(context)
+context_tensor = torch.tensor(context_encoded).unsqueeze(0)
+
+generated_text = context
+with torch.no_grad():
+    for _ in range(100):
+        outputs = model(context_tensor)
+        probs = torch.softmax(outputs[:, -1], dim=-1)
+        next_char_idx = torch.multinomial(probs, 1).item()
+        next_char = idx_to_char[next_char_idx]
+
+        generated_text += next_char
+        context_tensor = torch.cat([context_tensor[:, 1:], torch.tensor([[next_char_idx]])], dim=1)
+
+print(generated_text)

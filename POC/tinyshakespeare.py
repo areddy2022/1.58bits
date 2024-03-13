@@ -28,14 +28,25 @@ class TernaryLinear(nn.Linear):
         return self.ternary_linear(x, self.quantized_weight, self.bias)
 
     def pack_weights(self, ternary_weights):
-        packed_weights = torch.zeros((ternary_weights.shape[0], ternary_weights.shape[1] // 16), dtype=torch.int64)
+        # Calculate the number of packed values needed: each int8 can store 4 2-bit values
+        packed_shape = (ternary_weights.shape[0], (ternary_weights.shape[1] + 3) // 4)
+        packed_weights = torch.zeros(packed_shape, dtype=torch.uint8)
+
         for i in range(ternary_weights.shape[0]):
-            for j in range(ternary_weights.shape[1] // 16):
-                packed_value = 0
-                for k in range(16):
-                    value = int(ternary_weights[i, j * 16 + k].item())
-                    packed_value |= (value + 1) << (k * 2)
-                packed_weights[i, j] = packed_value
+            for j in range(ternary_weights.shape[1]):
+                # Find the index in the packed representation
+                packed_idx = j // 4
+                bit_idx = (j % 4) * 2  # Each weight needs 2 bits, so multiply by 2
+
+                # Convert ternary (-1, 0, 1) to binary (00, 01, 10) representation
+                # Adjusting the value: -1 -> 00 (0), 0 -> 01 (1), 1 -> 10 (2)
+                value = int(ternary_weights[i, j].item()) + 1
+                if not 0 <= value <= 2:
+                    raise ValueError(f"Invalid ternary value: {value}")
+
+                # Shift the binary representation to the correct position and OR it with the packed byte
+                packed_weights[i, packed_idx] |= (value << bit_idx)
+
         return packed_weights
 
     def ternary_linear(self, x, packed_weights, bias):
@@ -43,19 +54,73 @@ class TernaryLinear(nn.Linear):
         x_reshaped = x.reshape(batch_size * seq_length, input_dim)
         output_dim = packed_weights.shape[0]
         output = torch.zeros((batch_size * seq_length, output_dim), dtype=torch.float32, device=x.device)
-        for i in range(packed_weights.shape[0]):
+
+        for i in range(output_dim):
             for j in range(packed_weights.shape[1]):
                 packed_value = packed_weights[i, j].item()
-                for k in range(16):
-                    value = (packed_value >> (k * 2)) & 3
-                    if value == 1:
-                        output[:, i] += x_reshaped[:, j * 16 + k]
-                    elif value == 2:
-                        output[:, i] -= x_reshaped[:, j * 16 + k]
+                for k in range(4):
+                    # Extract the 2-bit value (value can be 0, 1, or 2)
+                    two_bit_value = (packed_value >> (2 * k)) & 0b11
+
+                    # Map the 2-bit value back to ternary (-1, 0, 1)
+                    if two_bit_value == 0:
+                        weight = -1
+                    elif two_bit_value == 2:
+                        weight = 1
+                    else:
+                        weight = 0
+
+                    # Apply the weight value
+                    if weight != 0:
+                        output[:, i] += weight * x_reshaped[:, j * 4 + k]
+
         if bias is not None:
-            output += bias
-        output = output.reshape(batch_size, seq_length, output_dim)
-        return output
+            output += bias.unsqueeze(0)
+
+        return output.reshape(batch_size, seq_length, output_dim)
+
+    def ternary_linear_optimized(self, x, packed_weights, bias):
+        # Reshape x for matrix operations: [Batch size * Sequence length, Input dimension]
+        x_reshaped = x.reshape(-1, x.size(-1))
+
+        # Initialize the output tensor
+        output = torch.zeros(x_reshaped.size(0), self.out_features, device=x.device)
+
+        # Iterate over each output dimension
+        for i in range(self.out_features):
+            # Extract the packed weights for the i-th output neuron
+            for j in range((self.in_features + 3) // 4):
+                # Get the 8-bit packed weight
+                packed_value = packed_weights[i, j].item()
+
+                # Process 4 weights at a time within each packed byte
+                for k in range(4):
+                    # Decode the 2-bit weight (-1, 0, 1)
+                    weight = ((packed_value >> (k * 2)) & 0b11) - 1
+
+                    # Skip if weight is 0 (no operation needed)
+                    if weight == 0:
+                        continue
+
+                    # Determine the index of the current weight
+                    weight_idx = j * 4 + k
+
+                    # Check for index out of bounds (for the last byte)
+                    if weight_idx >= self.in_features:
+                        break
+
+                    # Update the output: Add or subtract the input based on the weight
+                    if weight == 1:
+                        output[:, i] += x_reshaped[:, weight_idx]
+                    elif weight == -1:
+                        output[:, i] -= x_reshaped[:, weight_idx]
+
+        # Add bias if it's not None
+        if bias is not None:
+            output += bias.unsqueeze(0)
+
+        return output.reshape(x.size(0), x.size(1), self.out_features)
+
 
 # Transformer model with ternary quantized weights
 class TernaryTransformer(nn.Module):

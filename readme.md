@@ -1,7 +1,7 @@
 # Llama 3B Model with 1.58-bit Quantization
 
 ### TODO
-[ ] Integrate the new CUDA function
+[] Integrate the new CUDA kernel
 
 ## Introduction
 

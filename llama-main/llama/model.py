@@ -4,7 +4,6 @@
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
-from TernaryLinear import TernaryLinear
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch

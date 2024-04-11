@@ -2,21 +2,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 def quantize_activations(x):
-    scale = 127.0/x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
-    y = (x * scale).round().clamp_(-128, 127)/scale
+    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
+    y = (x * scale).round().clamp_(-128, 127) / scale
     return y
+
 
 def quantize_weights(W):
     scale = 1 / W.abs().mean().clamp_(1e-5)
     u = (W * scale).round().clamp_(-1, 1) / scale
     return u
 
+
 def activation_norm_quant(x):
     x = RMSNorm(x)
-    scale = 127.0/x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
+    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
     y = (x * scale).round().clamp_(-128, 127)
     return y, scale
+
 
 def RMSNorm(x, eps=1e-6):
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
@@ -31,6 +35,8 @@ def pack_weights(mapped_weights):
     packed_rows = []
     # This can be parallelized because each row is independent of each other
     # We can use the Rust bindings to generate high performant code to cut down on the run time for this function
+    # Okay maybe I'm going crazy but what happens if we divided each row into four number sub blocks then parallely
+    # converted those sub blocks into a single int8????
     for row in mapped_weights:
         full_groups, remainder = divmod(row.numel(), 4)
         packed_row = torch.zeros(full_groups + (remainder > 0), dtype=torch.uint8, device=row.device)

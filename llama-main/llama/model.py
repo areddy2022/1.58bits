@@ -1,6 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
+from bitlinear158 import BitLinear158Optimized
+
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -204,10 +206,10 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = TernaryLinear(args.dim, args.n_heads * self.head_dim)
-        self.wk = TernaryLinear(args.dim, self.n_kv_heads * self.head_dim)
-        self.wv = TernaryLinear(args.dim, self.n_kv_heads * self.head_dim)
-        self.wo = TernaryLinear(args.n_heads * self.head_dim, args.dim)
+        self.wq = BitLinear158Optimized(args.dim, args.n_heads * self.head_dim)
+        self.wk = BitLinear158Optimized(args.dim, self.n_kv_heads * self.head_dim)
+        self.wv = BitLinear158Optimized(args.dim, self.n_kv_heads * self.head_dim)
+        self.wo = BitLinear158Optimized(args.n_heads * self.head_dim, args.dim)
 
         self.cache_k = torch.zeros(
             (
@@ -313,9 +315,9 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = TernaryLinear(dim, hidden_dim)
-        self.w2 = TernaryLinear(hidden_dim, dim)
-        self.w3 = TernaryLinear(dim, hidden_dim)
+        self.w1 = BitLinear158Optimized(dim, hidden_dim)
+        self.w2 = BitLinear158Optimized(hidden_dim, dim)
+        self.w3 = BitLinear158Optimized(dim, hidden_dim)
 
        
     def forward(self, x):
@@ -417,8 +419,8 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(
-            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
+        self.output = BitLinear158Optimized(
+            params.dim, params.vocab_size, bias=False
         )
 
         self.freqs_cis = precompute_freqs_cis(
@@ -426,6 +428,12 @@ class Transformer(nn.Module):
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
+
+    def switch_to_inference(self):
+        for module in self.modules():
+            if isinstance(module, BitLinear158Optimized):
+                module.switch_to_inference()
+
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
@@ -440,6 +448,7 @@ class Transformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
+        self.switch_to_inference()
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)

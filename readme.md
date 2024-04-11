@@ -1,5 +1,8 @@
 # Llama 3B Model with 1.58-bit Quantization
 
+### TODO
+[] Integrate the new CUDA kernel
+
 ## Introduction
 
 The Llama 3B model represents a groundbreaking advancement in natural language processing and machine learning. This version of the model is enhanced with a 1.58-bit quantization technique, significantly optimizing its efficiency and computational resource usage without compromising the model's performance. This innovative approach allows for faster inference times and reduced model size, making it ideal for deployment in environments with limited resources.

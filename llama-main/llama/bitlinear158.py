@@ -10,6 +10,7 @@ def quantize_activations(x):
 
 
 def quantize_weights(W):
+    scale = 1 / W.abs().mean().clamp_(1e-5)
     u = (W * scale).round().clamp_(-1, 1)
     return u
 
